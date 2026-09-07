@@ -26,7 +26,7 @@ on:
         description: "Semicolon-separated commands to run/verify on the box before JIT registration."
         required: false
         type: string
-        default: "dnf install -y ansible-core python3-pip make; pip3 install ansible; command -v ansible-playbook; command -v make"
+        default: "dnf install -y ansible-core python3-pip make podman; /usr/bin/python3 -m pip install --ignore-installed ansible; command -v ansible-playbook; command -v make; command -v podman"
       osac-operator-image:
         description: "Override osac-operator image (registry-pullable reference) -- empty means no override"
         required: false
@@ -73,6 +73,31 @@ on:
         required: false
         type: string
         default: ""
+      test-infra-ref:
+        description: "Branch, tag, or commit of the test-infra repository to checkout"
+        required: false
+        type: string
+        default: ""
+      test-infra-sha:
+        description: "Exact commit SHA of the test-infra repository to checkout"
+        required: false
+        type: string
+        default: ""
+      pr-repository:
+        description: "Repository containing the expected PR head"
+        required: false
+        type: string
+        default: ""
+      pr-ref:
+        description: "Expected PR head branch/ref"
+        required: false
+        type: string
+        default: ""
+      pr-sha:
+        description: "Expected immutable PR head SHA"
+        required: false
+        type: string
+        default: ""
       fork-pr-author-association:
         description: "PR author_association from the caller"
         required: false
@@ -99,11 +124,13 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: ${{ inputs.test-infra-repository || github.repository }}
+          ref: ${{ inputs.test-infra-sha || inputs.test-infra-ref || github.ref }}
           persist-credentials: false
 
       - name: Validate and bootstrap
@@ -113,6 +140,13 @@ jobs:
           test-suite: ec2-runner
           run-id: ${{ github.run_id }}
 
+      - name: Validate pull request metadata
+        if: (inputs.pr-number == '' && inputs.pr-sha != '') || (inputs.pr-number != '' && inputs.pr-sha == '')
+        shell: bash
+        run: |
+          echo "::error::pr-number and pr-sha must be supplied together."
+          exit 1
+
       - name: Authorize fork PR
         if: inputs.fork-pr-author-association != ''
         uses: ./.github/actions/authorize-fork-pr
@@ -121,6 +155,34 @@ jobs:
           secret-id: ${{ steps.setup.outputs.secret-id }}
           fork-pr-author: ${{ inputs.fork-pr-author }}
           pr-number: ${{ inputs.pr-number }}
+
+      - name: Validate pull request revision
+        if: inputs.pr-number != '' && inputs.pr-sha != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          EXPECTED_SHA: ${{ inputs.pr-sha }}
+          EXPECTED_REF: ${{ inputs.pr-ref }}
+          EXPECTED_REPOSITORY: ${{ inputs.pr-repository }}
+        run: |
+          set -euo pipefail
+          pr_json=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          actual_sha=$(jq -r '.head.sha' <<<"${pr_json}")
+          actual_ref=$(jq -r '.head.ref' <<<"${pr_json}")
+          actual_repository=$(jq -r '.head.repo.full_name' <<<"${pr_json}")
+          [[ "${actual_sha}" == "${EXPECTED_SHA}" ]] || {
+            echo "::error::PR head SHA changed; refusing to provision."
+            exit 1
+          }
+          [[ -z "${EXPECTED_REPOSITORY}" || "${actual_repository}" == "${EXPECTED_REPOSITORY}" ]] || {
+            echo "::error::PR head repository changed; refusing to provision."
+            exit 1
+          }
+          [[ -z "${EXPECTED_REF}" || "${actual_ref}" == "${EXPECTED_REF}" ]] || {
+            echo "::error::PR head ref changed; refusing to provision."
+            exit 1
+          }
 
   provision:
     needs: authorize
@@ -133,6 +195,8 @@ jobs:
       orchestrator-runner-label: ${{ inputs.orchestrator-runner-label }}
       tooling-check-cmds: ${{ inputs.tooling-check-cmds }}
       test-infra-repository: ${{ inputs.test-infra-repository }}
+      test-infra-ref: ${{ inputs.test-infra-ref }}
+      test-infra-sha: ${{ inputs.test-infra-sha }}
 
   push-secrets:
     needs: provision
@@ -147,6 +211,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: ${{ inputs.test-infra-repository || github.repository }}
+          ref: ${{ inputs.test-infra-sha || inputs.test-infra-ref || github.ref }}
           persist-credentials: false
 
       - name: Validate and bootstrap
@@ -250,6 +315,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: ${{ inputs.test-infra-repository || github.repository }}
+          ref: ${{ inputs.test-infra-sha || inputs.test-infra-ref || github.ref }}
           persist-credentials: false
 
       - name: Validate component image override inputs
@@ -402,7 +468,7 @@ jobs:
             fi
 
             if [[ "${build_type}" == "ansible-builder" ]]; then
-              pip3 install --quiet 'ansible-builder~=3.0'
+              /usr/bin/python3 -m pip install --ignore-installed --quiet 'ansible-builder~=3.0'
               ansible-builder create --file "${component_dir}/${containerfile_name}" --context "${component_dir}/context"
               podman build -t "${tag}" -f "${component_dir}/context/Containerfile" "${component_dir}/context"
             else
@@ -475,13 +541,25 @@ jobs:
         continue-on-error: true
         run: make gather-suite INFRA=netris SUITE=bmaas_networking
 
+      - name: Archive Netris artifacts
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          archive_paths=()
+          [[ -d reports ]] && archive_paths+=(reports)
+          [[ -d infra/netris/logs ]] && archive_paths+=(infra/netris/logs)
+          if (( ${#archive_paths[@]} > 0 )); then
+            tar -czf bmaas-netris-artifacts.tar.gz "${archive_paths[@]}"
+          fi
+
       - name: Upload artifacts
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bmaas-netris-artifacts
-          path: infra/netris/logs/
+          path: bmaas-netris-artifacts.tar.gz
           if-no-files-found: ignore
 
       - name: Gather EC2 runner artifacts
@@ -500,3 +578,5 @@ jobs:
       orchestrator-runner-label: ${{ inputs.orchestrator-runner-label }}
       aws-region: ${{ inputs.aws-region }}
       test-infra-repository: ${{ inputs.test-infra-repository }}
+      test-infra-ref: ${{ inputs.test-infra-ref }}
+      test-infra-sha: ${{ inputs.test-infra-sha }}

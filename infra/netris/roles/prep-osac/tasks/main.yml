@@ -114,7 +114,10 @@
       {{ {'cliImage': _ocp_cli_image.stdout | trim,
           'bundledPostgres': {'enabled': true},
           'lvms': {'enabled': true, 'channel': 'stable-' + ocp_version},
-          'operator': {'aap': {'tokenSecret': {'name': 'osac-aap-api-token', 'key': 'token'}}},
+          'operator': {'aap': {'tokenSecret': {'name': 'osac-aap-api-token', 'key': 'token'}},
+                       'controllers': {'networkingProvisioning': true}},
+          'bmf': {'env': {'enableNetworkingProvisioning': 'true'}},
+          'networkClass': {'enabled': true, 'title': 'Netris', 'fabricManager': 'netris'},
           'aap': {'instanceGroups': {'clusterFulfillment': {'enabled': true, 'config': {
               'NETWORK_CLASS': 'netris',
               'NETWORK_STEPS_COLLECTION': 'netris.steps',
@@ -266,6 +269,10 @@
       spec:
         provisioningNetwork: "Disabled"
         watchAllNamespaces: true
+        disableVirtualMediaTLS: true
+        provisioningIP: "{{ bmc_net_ocp_ip }}"
+        externalIPs:
+          - {{ bmc_net_ocp_ip }}
       EOF
   environment:
     KUBECONFIG: /root/.kube/config
