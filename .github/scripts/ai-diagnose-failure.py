@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 MAX_FAILURES = 5
@@ -306,6 +307,26 @@ MAX_LISTED_FILES = 300
 # have room left over regardless of how much the model reasons first.
 MAX_OUTPUT_TOKENS = 65536
 THINKING_BUDGET_TOKENS = 24576
+# How many extra attempts _generate_with_retry makes after an incomplete
+# first response, before giving up -- confirmed live across two separate
+# runs (33965773078, 34119831369) that this is a genuine, recurring Vertex
+# AI/Gemini reliability quirk (finish_reason=STOP, empty text, a tiny
+# fraction of THINKING_BUDGET_TOKENS actually used -- not a token-budget
+# exhaustion issue), not a one-off. Raised from 1: with a transient,
+# probabilistic backend issue, more attempts genuinely improve the odds of
+# eventually getting a real answer instead of a degraded "diagnosis
+# unavailable" Slack post, unlike a deterministic failure (e.g. a content-
+# policy block, handled separately by _is_blocked) where extra attempts
+# just reproduce the same result for the same cost.
+MAX_RETRIES = 5
+# Exponential backoff between retries -- a short pause gives a transient,
+# probabilistic backend issue (a specific overloaded replica, a brief
+# capacity blip) more room to clear before hitting it again, rather than
+# hammering the same failure mode back-to-back with no delay at all.
+# Capped so a worst-case run of MAX_RETRIES failures doesn't add an
+# unbounded amount of wall-clock time on top of an already-failed E2E job.
+RETRY_BACKOFF_BASE_SECONDS = 2
+RETRY_BACKOFF_MAX_SECONDS = 30
 # The bar a diagnosis must clear before it's presented as definitive, rather
 # than deferring to "go check the logs yourself" -- see CONFIDENCE_PATTERN.
 # Raised from 85: real artifacts are often dominated by noise unrelated to
@@ -544,67 +565,177 @@ def extract_category(text):
 # "### Causal chain" heading. Anchored at position 0 (re.match), same
 # reasoning as CATEGORY_PATTERN: this must be the model's own first section,
 # never something matched out of untrusted evidence quoted further down.
-ROOT_CAUSE_PATTERN = re.compile(r"### Root cause\s*\n(.*?)\n+(?=### Causal chain\b)", re.DOTALL)
+ROOT_CAUSE_PATTERN = re.compile(r"### Root cause\s*\n(.*?)\n+(?=### (?:Causal chain|Evidence)\b)", re.DOTALL)
+
+# Causal chain bounded the same way as Root cause -- captured between its
+# own heading and the next section's heading, OR the end of the string if
+# the model deviated from the requested structure and never produced an
+# "### Evidence" heading at all (Evidence is normally the LAST section --
+# see below -- so a model that stops after Causal chain leaves nothing
+# after it to bound against). Without the "or end of string" branch, that
+# deviation would silently drop a real, present Causal chain section
+# entirely instead of just leaving Evidence/footer absent.
+CAUSAL_CHAIN_PATTERN = re.compile(r"### Causal chain\s*\n(.*?)(?=\n+### Evidence\b|\Z)", re.DOTALL)
+# The prompt no longer has a Conclusion section (dropped as redundant with
+# Root cause -- Root cause already states the diagnosis, and the model's
+# "next step" text rarely added anything the developer couldn't get from
+# Evidence/Causal chain directly), so Evidence is normally the LAST
+# section: it runs to the end of the (already footer-stripped, see
+# split_sections) diagnosis, with no following heading to bound it.
+EVIDENCE_PATTERN = re.compile(r"### Evidence\s*\n(.*)", re.DOTALL)
+
+# The confidence/cost/incomplete-response footer call_gemini appends as
+# "\n\n<sub>...</sub>" at the very end of the diagnosis. Split off first
+# (before the section patterns above run) so EVIDENCE_PATTERN's
+# run-to-end-of-string match captures only the model's own Evidence
+# prose, never this footer.
+FOOTER_PATTERN = re.compile(r"\n\n(<sub>.*</sub>)\s*$", re.DOTALL)
 
 
-def split_root_cause(diagnosis):
-    """Split the model's full structured diagnosis into (summary, detail).
+def split_sections(diagnosis):
+    """Split the model's full structured diagnosis into its named
+    sections: (summary, causal_chain, evidence, footer).
 
     `summary` is the Root cause section's own prose, collapsed to a single
-    line -- short enough to stand alone as an always-visible teaser above a
-    collapsed section, and it changes every run (unlike the header line,
-    which only ever shows the workflow name and category badge). `detail`
-    is everything else (Causal chain / Evidence / Conclusion, plus the
-    confidence/cost footer call_gemini already appended), meant to go
-    inside a <details> block -- see main()'s use of this for why <details>
-    and not <sub>: <details> is a plain block element, so nesting Evidence's
-    code fences and the Causal chain's bullet list inside it doesn't hit the
-    line-height:0 inheritance bug <sub> has for multi-line content (see the
-    "Prepare comment section" step in ai-diagnostic-e2e.yml for the full
-    history of that bug).
+    line -- short enough to stand alone as an always-visible teaser. The
+    other two map directly to their "### " sections, each left as
+    multi-line prose/bullets/code fences for the caller to format (see
+    main()'s use of this -- Causal chain and Evidence become their own
+    SEPARATE <details> collapses, so Confidence in particular is never
+    hidden behind a click). `footer` is the trailing "<sub>Confidence:
+    ...</sub>" block call_gemini already appended, or None if it's
+    missing (e.g. the footer-formatting exception path in call_gemini,
+    which leaves it off entirely).
 
-    Returns (None, diagnosis) unchanged if the expected structure isn't
-    found -- e.g. the "_AI diagnosis unavailable: ..._" exception-fallback
-    path in main(), which never has a "### Root cause" heading at all.
-    Callers must treat a None summary as "don't split", not as an error.
+    Returns all-None if the expected "### Root cause" structure isn't
+    found at all -- e.g. the "_AI diagnosis unavailable: ..._"
+    exception-fallback path in main(), which never has any section
+    headings. Callers must treat a None summary as "don't split", not as
+    an error. A missing Causal chain/Evidence section (model deviated
+    from the requested structure) degrades independently -- it comes
+    back as None too, but summary is still usable.
     """
-    match = ROOT_CAUSE_PATTERN.match(diagnosis)
-    if not match:
-        return None, diagnosis
-    summary = " ".join(match.group(1).split())
-    detail = diagnosis[match.end() :].strip()
-    return summary, detail
+    footer_match = FOOTER_PATTERN.search(diagnosis)
+    if footer_match:
+        footer = footer_match.group(1)
+        body = diagnosis[: footer_match.start()]
+    else:
+        footer = None
+        body = diagnosis
+
+    root_cause_match = ROOT_CAUSE_PATTERN.match(body)
+    if not root_cause_match:
+        return None, None, None, None
+    summary = " ".join(root_cause_match.group(1).split())
+
+    causal_chain_match = CAUSAL_CHAIN_PATTERN.search(body)
+    causal_chain = causal_chain_match.group(1).strip() if causal_chain_match else None
+
+    evidence_match = EVIDENCE_PATTERN.search(body)
+    evidence = evidence_match.group(1).strip() if evidence_match else None
+
+    return summary, causal_chain, evidence, footer
 
 
-# Matches the boundary between the Causal chain section's own content and
-# the following "### Evidence" heading -- used to insert the Full run link
-# as the last item of Causal chain, not as a trailing line after the whole
-# diagnosis (which is what it used to be) or the "### Evidence" heading is
-# not consumed here, just used as an anchor.
-EVIDENCE_HEADING_RE = re.compile(r"\n+(?=### Evidence\b)")
+def collapse(summary_label, text):
+    """Wrap `text` in its own <details>/<summary> collapse.
+
+    <details> is a plain block element (unlike <sub>, whose
+    `line-height: 0` collapses vertical spacing between any multi-line
+    content placed inside it -- see the "Prepare comment section" step in
+    ai-diagnostic-e2e.yml for the full history of that bug), so nesting a
+    bullet list or code fences inside it is safe. Slack has no
+    equivalent, so prepare-diagnosis-for-slack/action.yml unwraps these
+    tags entirely for that destination -- there, the content just reads
+    as a plain, always-visible block instead of a collapse (Slack simply
+    doesn't have collapsible text), which is an acceptable per-platform
+    difference rather than something to work around here.
+    """
+    return f"<details>\n<summary><sub>{summary_label}</sub></summary>\n\n{text}\n\n</details>"
 
 
-def insert_full_run_link(detail, run_url):
-    """Place the Full run link at the end of the Causal chain section
-    (right before Evidence), as its own single-line, <sub>-wrapped
-    paragraph -- single line with blank lines on both sides, so it can't
-    hit the <sub> multi-line overlap bug split_root_cause's own docstring
-    describes.
-
-    Falls back to appending after `detail` entirely (still inside the
-    <details> block) if the "### Evidence" heading isn't found -- e.g. an
-    exception-fallback diagnosis with no real section structure at all.
+def format_full_run_line(run_url):
+    """A plain sentence pointing at the full run, meant to close out the
+    always-visible summary -- replaces the old standalone "<sub>[Full
+    run](url)</sub>" link, which used to be spliced into the middle of
+    the Causal chain section and, before that fix, broke Slack's
+    rendering entirely when left inside an unstripped <sub> wrapper (see
+    prepare-diagnosis-for-slack/action.yml's HTML-stripping step for that
+    history). As part of the summary's own prose there's no reason to
+    isolate it in a <sub> anymore.
     """
     if not run_url:
-        return detail
-    link = f"<sub>[Full run]({run_url})</sub>"
-    match = EVIDENCE_HEADING_RE.search(detail)
-    if not match:
-        return f"{detail}\n\n{link}"
-    # match spans ALL the newlines between Causal chain's last line and
-    # "### Evidence" (the `\n+` is greedy) -- slice at start/end (not just
-    # start) so those original newlines are fully replaced, not added to.
-    return f"{detail[: match.start()]}\n\n{link}\n\n{detail[match.end() :]}"
+        return ""
+    return f"To see the full run, check the [workflow run]({run_url})."
+
+
+def build_diagnosis_body(diagnosis, run_url, workflow_name, category, incomplete=False):
+    """Assemble the final posted markdown: title, an always-visible
+    one-line summary (ending with the full-run link), then Causal chain
+    and Evidence as their own SEPARATE <details> collapses, and finally
+    the always-visible confidence/cost footer.
+
+    Previously Causal chain, Evidence, AND the confidence footer were all
+    bundled together behind one shared collapsed <details> block --
+    meaning Confidence (arguably the single most important line for
+    deciding how much to trust the diagnosis) was hidden behind a click
+    along with everything else. Now Causal chain and Evidence each get
+    their own independent collapse (so a reader can expand just the one
+    they want), and Confidence is never collapsed at all. There's also no
+    separate Conclusion section anymore -- it was dropped as redundant
+    with Root cause (the summary already states the diagnosis; the
+    model's "next step" text rarely added anything beyond what Evidence/
+    Causal chain already show), so the full-run link that used to close
+    out Conclusion now closes out the summary instead.
+
+    Falls back to the raw diagnosis text (title + full-run line appended,
+    but no section restructuring) if the expected "### Root cause"
+    structure isn't there at all -- e.g. the "_AI diagnosis unavailable:
+    ..._" exception-fallback diagnosis, or Gemini's own "(empty response
+    from Gemini: ...)" placeholder text after every retry was exhausted
+    -- neither ever has any section headings to split on.
+
+    Returns (body_md, diagnosis_available). `diagnosis_available` is
+    False in that same fallback case, AND whenever `incomplete` is True
+    (see _generate_with_retry's own return value) regardless of what
+    split_sections found -- a response that hit MAX_TOKENS/was blocked/
+    came back empty even after every retry can still have a well-formed
+    "### Root cause" section in its partial text (e.g. cut off after
+    Causal chain but before Evidence/Confidence), which would otherwise
+    pass the structural check above despite the response's own "⚠️
+    Incomplete" footer already saying not to trust it. Callers (see
+    main()'s own GITHUB_OUTPUT write) use diagnosis_available to tell the
+    calling workflow not to bother posting a Slack thread reply or
+    pinging chai-bot to verify a "diagnosis" that's really just a canned
+    failure message -- or an untrustworthy partial one -- with nothing
+    solid to act on.
+    """
+    title = f"# ❌ {workflow_name} -- AI Diagnosis | Category: `{category or 'UNKNOWN'}`"
+    full_run_line = format_full_run_line(run_url)
+
+    summary, causal_chain, evidence, footer = split_sections(diagnosis.strip())
+    if summary is None:
+        body = diagnosis.strip()
+        if full_run_line:
+            body = f"{body}\n\n{full_run_line}"
+        return f"{title}\n\n{body}", False
+
+    summary_text = f"{summary}\n\n{full_run_line}" if full_run_line else summary
+    parts = [summary_text]
+    if causal_chain:
+        parts.append(collapse("Causal chain", causal_chain))
+    if evidence:
+        parts.append(collapse("Evidence", evidence))
+    if footer:
+        parts.append(footer)
+
+    # Structure and content still render normally (e.g. GITHUB_STEP_SUMMARY
+    # and the PR sticky comment show it regardless) -- only the returned
+    # availability flag is affected, since `incomplete` here means the
+    # response itself already carries a "⚠️ Incomplete" footer flagging it
+    # as untrustworthy, which the Slack/chai-bot gating in main() needs to
+    # know about even when the partial text still parsed cleanly.
+    return f"{title}\n\n" + "\n\n".join(parts), not incomplete
 
 
 def format_confidence_line(confidence):
@@ -711,11 +842,11 @@ def compute_cost(usage_metadata, model):
 
 def aggregate_cost(usage_metadata_list, model):
     """Sum compute_cost's numbers across EVERY generation attempt actually
-    made for one diagnosis -- the initial send_message plus a retry turn,
-    if _generate_with_retry sent one -- rather than just the final
-    attempt's own usage_metadata.
+    made for one diagnosis -- the initial send_message plus however many
+    retry turns _generate_with_retry sent (up to MAX_RETRIES) -- rather
+    than just the final attempt's own usage_metadata.
 
-    This matters specifically because of the retry: each attempt is billed
+    This matters specifically because of retries: each attempt is billed
     on its own (Gemini resends the whole growing conversation as input on
     every turn, including the prior attempt's own output as context, and
     bills a fresh set of output tokens for whatever it generates this
@@ -854,9 +985,9 @@ def _is_blocked(resp):
     per _finish_reason's own docstring, a prompt-level safety block never
     produces a finish_reason on a candidate at all (there may be no
     candidates whatsoever) -- so checking finish_reason alone would miss
-    this case entirely and let _generate_with_retry waste its one retry
-    on a prompt that's guaranteed to be rejected again for the exact same
-    reason. Same defensive nested-attribute pattern as
+    this case entirely and let _generate_with_retry waste every retry
+    attempt on a prompt that's guaranteed to be rejected again for the
+    exact same reason. Same defensive nested-attribute pattern as
     _describe_empty_response's own prompt_feedback lookup, since
     prompt_feedback can itself be absent.
     """
@@ -1015,63 +1146,90 @@ _RETRY_PROMPT = (
     "section headers and format. If you were cut off for length, be significantly "
     "more concise this time: shorter Evidence quotes (one line each is enough), "
     "fewer Causal chain bullets, no filler. Either way, prioritize actually "
-    "writing out the complete answer -- reaching the Conclusion and the final "
-    "Confidence line -- over exhaustive detail."
+    "writing out the complete answer -- reaching the Evidence section and the "
+    "final Confidence line -- over exhaustive detail."
 )
 
 
 def _generate_with_retry(chat, prompt):
-    """Send `prompt`, retrying ONCE with a follow-up turn if the response
-    is incomplete (see _is_incomplete: it hit max_output_tokens, or it
-    came back with no text at all for some other, non-blocked reason).
+    """Send `prompt`, retrying up to MAX_RETRIES times with a follow-up
+    turn each time if the response is incomplete (see _is_incomplete: it
+    hit max_output_tokens, or it came back with no text at all for some
+    other, non-blocked reason). Waits an exponentially increasing,
+    capped delay (RETRY_BACKOFF_BASE_SECONDS/RETRY_BACKOFF_MAX_SECONDS)
+    before each retry.
 
     A fresh turn gets its own full max_output_tokens budget again, and the
     model already has every read_artifact_file call's evidence sitting in
     this same chat's history -- asking it to actually produce a complete
     answer from what it already gathered is a real repair, not just a
-    relabeled failure. Only one retry: if it's still bad on a second
-    attempt, a third pass is unlikely to help and just doubles the cost
-    again for no gain. Skips the retry entirely for a genuine
-    content-policy block (_is_blocked) -- retrying the same prompt/history
-    against the same filter would almost certainly reproduce it.
+    relabeled failure. Multiple retries (not just one) because this has
+    now been confirmed live, twice (runs 33965773078, 34119831369), as a
+    genuine transient/probabilistic Vertex AI reliability quirk rather
+    than a deterministic one -- each additional attempt gets a real,
+    independent chance at succeeding, unlike retrying a deterministic
+    failure (e.g. a content-policy block) which would just reproduce the
+    same result for the same cost every time. Skips retrying entirely for
+    a genuine content-policy block (_is_blocked) for exactly that reason.
 
     Returns (resp, incomplete, usage_metadata_list). `incomplete` is True
-    only if the response being returned is STILL bad after the retry (or
-    a retry was skipped as pointless) -- the caller uses this to flag the
-    diagnosis explicitly rather than silently presenting a bad answer as a
-    complete one. `usage_metadata_list` carries every attempt actually
-    made (one entry, or two if a retry was sent) so the caller can add up
-    the REAL total cost across attempts -- see aggregate_cost's docstring
-    for why the final attempt's usage_metadata alone would silently drop
-    an earlier attempt's already-incurred cost.
+    only if the response being returned is STILL bad after every retry
+    (or a retry was skipped as pointless) -- the caller uses this to flag
+    the diagnosis explicitly rather than silently presenting a bad answer
+    as a complete one. `usage_metadata_list` carries every attempt
+    actually made (one entry, or up to 1 + MAX_RETRIES if every retry was
+    needed) so the caller can add up the REAL total cost across attempts
+    -- see aggregate_cost's docstring for why the final attempt's
+    usage_metadata alone would silently drop an earlier attempt's
+    already-incurred cost.
     """
     resp = chat.send_message(prompt)
     usage_metadata_list = [resp.usage_metadata]
+    attempts = [resp]
     if not _is_incomplete(resp):
         return resp, False, usage_metadata_list
     _dump_incomplete_response_debug(resp, prompt, chat)
     if _is_blocked(resp):
         return resp, True, usage_metadata_list
+
+    for attempt_num in range(1, MAX_RETRIES + 1):
+        delay = min(RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt_num - 1)), RETRY_BACKOFF_MAX_SECONDS)
+        _safe_print(
+            f"WARNING: Gemini's response was incomplete ({_describe_empty_response(attempts[-1])}); "
+            f"retrying (attempt {attempt_num}/{MAX_RETRIES}) after a {delay}s backoff.",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+        retry_resp = chat.send_message(_RETRY_PROMPT)
+        usage_metadata_list.append(retry_resp.usage_metadata)
+        attempts.append(retry_resp)
+        if not _is_incomplete(retry_resp):
+            return retry_resp, False, usage_metadata_list
+        _dump_incomplete_response_debug(retry_resp, _RETRY_PROMPT, chat)
+        if _is_blocked(retry_resp):
+            # retry_resp itself is almost always empty here (a genuine
+            # content-policy block rarely leaves any text), but an
+            # EARLIER attempt in this same loop could have hit MAX_TOKENS
+            # with real, useful partial text before this later retry got
+            # blocked -- same "prefer the last attempt with SOME text"
+            # logic as the give-up-after-every-retry fallback below, so a
+            # block on attempt N+1 can't silently discard attempt N's
+            # genuinely useful (if incomplete) answer. Falls back to
+            # retry_resp itself (== attempts[-1]) when nothing earlier had
+            # text either, same as before this fix.
+            final_resp = next((r for r in reversed(attempts) if r.text), retry_resp)
+            return final_resp, True, usage_metadata_list
+
     _safe_print(
-        f"WARNING: Gemini's response was incomplete ({_describe_empty_response(resp)}); "
-        "retrying once for a complete answer.",
+        f"WARNING: All {MAX_RETRIES} retries were also incomplete "
+        f"({_describe_empty_response(attempts[-1])}); giving up.",
         file=sys.stderr,
     )
-    retry_resp = chat.send_message(_RETRY_PROMPT)
-    usage_metadata_list.append(retry_resp.usage_metadata)
-    if not _is_incomplete(retry_resp):
-        return retry_resp, False, usage_metadata_list
-    _dump_incomplete_response_debug(retry_resp, _RETRY_PROMPT, chat)
-    _safe_print(
-        f"WARNING: Retry was also incomplete ({_describe_empty_response(retry_resp)}); "
-        "giving up after one retry.",
-        file=sys.stderr,
-    )
-    # Prefer whichever attempt actually has SOME text -- a truncated (or
-    # otherwise imperfect) but non-empty answer is still more useful (once
-    # flagged below) than a totally empty one. The retry wins ties (e.g.
-    # both have text) since it's the more considered attempt.
-    final_resp = retry_resp if retry_resp.text else (resp if resp.text else retry_resp)
+    # Prefer the LAST attempt that actually has SOME text -- a truncated
+    # (or otherwise imperfect) but non-empty answer is still more useful
+    # (once flagged above) than a totally empty one, and a later attempt
+    # is the more considered one among any tie.
+    final_resp = next((r for r in reversed(attempts) if r.text), attempts[-1])
     return final_resp, True, usage_metadata_list
 
 
@@ -1132,7 +1290,7 @@ def call_gemini(prompt, artifact_dir):
         # (verbose model hitting the token limit again, a repeated empty
         # response, or a content-policy block) -- surfaced explicitly
         # rather than silently presenting a bad answer (missing its
-        # Conclusion/Confidence line, empty, or cut off mid-sentence) as
+        # Evidence/Confidence line, empty, or cut off mid-sentence) as
         # if it were a complete one. Deliberately doesn't claim "even
         # after a retry": a content-policy block (_is_blocked) skips the
         # retry entirely, so that wording would be false in that case.
@@ -1147,7 +1305,15 @@ def call_gemini(prompt, artifact_dir):
     except Exception:  # noqa: BLE001 -- a footer-formatting bug must never lose a real diagnosis
         footer = ""
     diagnosis = f"{text}\n\n{footer}" if footer else text
-    return diagnosis, category, cost_usd, input_tokens, output_tokens
+    # `incomplete` is returned (not just folded into the footer text) so
+    # build_diagnosis_body can force diagnosis_available=False for a
+    # truncated/blocked/empty response even when its partial text happens
+    # to still contain a well-formed "### Root cause" section -- e.g. cut
+    # off after Causal chain but before Evidence/Confidence. Without this,
+    # such a response would pass split_sections' structural check and get
+    # posted to Slack / pinged to chai-bot as if it were a normal,
+    # trustworthy diagnosis, contradicting its own "⚠️ Incomplete" footer.
+    return diagnosis, category, cost_usd, input_tokens, output_tokens, incomplete
 
 
 def main():
@@ -1326,19 +1492,6 @@ Never state a claim as prose without a citation backing it -- if you
 can't point to a specific line, use read_artifact_file to find one, or
 don't make that claim.
 
-### Conclusion
-One or two sentences a developer can act on immediately: which component
-is implicated, and ONE concrete, specific next step -- e.g. "check
-whether osac-operator's ClusterOrder reconciler handles a nil X" or
-"verify the AAP playbook's Y task against the new Z field this PR adds",
-something to actually go act on. Do NOT default to "check the logs" or
-"look at the run/artifact" -- the developer already knows the run failed;
-that tells them nothing new. Only fall back to pointing at the GitHub
-Actions run's own job logs at the URL above if you have used
-read_artifact_file and there is genuinely no file left worth reading, and
-say explicitly that this is a fallback due to insufficient evidence, not
-your normal answer.
-
 You must reach a DEFINITIVE root cause with at least
 {CONFIDENCE_THRESHOLD_PERCENT}% confidence before finalizing. If the
 bounded extract above doesn't clearly support that confidence level, use
@@ -1370,34 +1523,19 @@ correct.
 """
 
     try:
-        diagnosis, category, cost_usd, input_tokens, output_tokens = call_gemini(prompt, ARTIFACT_DIR)
+        diagnosis, category, cost_usd, input_tokens, output_tokens, incomplete = call_gemini(prompt, ARTIFACT_DIR)
     except Exception as exc:  # noqa: BLE001 -- must never crash the job
         diagnosis = f"_AI diagnosis unavailable: {exc}_"
         category = None
         cost_usd = input_tokens = output_tokens = None
+        # No "### Root cause" structure in this fallback text either way
+        # (build_diagnosis_body already treats it as unavailable), but
+        # True is also the semantically correct value here regardless:
+        # an exception before Gemini ever finished is exactly the kind of
+        # response nothing should be built on top of.
+        incomplete = True
 
-    # Split into an always-visible one-line summary (the Root cause prose)
-    # plus a <details>-collapsed block for everything else. <details> is a
-    # plain block element (unlike <sub>, whose `line-height: 0` collapses
-    # vertical spacing between any multi-line content placed inside it --
-    # see the "Prepare comment section" step in ai-diagnostic-e2e.yml for
-    # the full history of that bug), so nesting the Causal chain's bullet
-    # list and Evidence's code fences inside it is safe. Falls back to the
-    # full, unsplit diagnosis (no collapse at all) if the expected
-    # "### Root cause" structure isn't there, e.g. the exception-fallback
-    # diagnosis set above.
-    summary, detail = split_root_cause(diagnosis.strip())
-    detail = insert_full_run_link(detail, RUN_URL)
-    if summary:
-        body_md = (
-            f"{summary}\n\n"
-            "<details>\n"
-            "<summary><sub>Causal chain, evidence &amp; confidence</sub></summary>\n\n"
-            f"{detail}\n\n"
-            "</details>"
-        )
-    else:
-        body_md = detail
+    body_md, diagnosis_available = build_diagnosis_body(diagnosis, RUN_URL, WORKFLOW_NAME, category, incomplete)
 
     # Each write below is independently guarded: a failure writing ONE of
     # these (a full disk, a permissions issue, GITHUB_STEP_SUMMARY being
@@ -1408,10 +1546,6 @@ correct.
     if SUMMARY_PATH:
         try:
             with open(SUMMARY_PATH, "a") as f:
-                # Plain bold text, not <sub> -- a header this short never
-                # risks the multi-line overlap bug, and shrinking it read
-                # as too small in practice.
-                f.write(f"**AI Failure Diagnosis:** {WORKFLOW_NAME} | Category: `{category or 'UNKNOWN'}`\n\n")
                 f.write(body_md + "\n")
         except Exception as exc:  # noqa: BLE001 -- see comment above
             _safe_print(f"WARNING: failed to write GITHUB_STEP_SUMMARY: {_safe_repr(exc)}", file=sys.stderr)
@@ -1428,6 +1562,12 @@ correct.
     # ai-diagnostic-e2e.yml's own steps can use them directly:
     # - category folds into the section header as a scannable triage badge
     #   (see "Prepare comment section" for how it's consumed).
+    # - diagnosis-available lets the E2E full-install workflows gate their
+    #   "Post AI diagnosis to Slack thread"/"Ping chai-bot to verify
+    #   failure" steps -- there's nothing for a human or chai-bot to act
+    #   on in Gemini's own placeholder text after every retry came back
+    #   empty, or in the exception-fallback message, so those two Slack
+    #   posts should simply not happen rather than posting noise.
     # - cost/token numbers let "Build updated comment body" maintain a
     #   running total-cost footer across every diagnosis posted to a PR's
     #   sticky comment (upsert-pr-comment.py adds these to whatever total
@@ -1442,6 +1582,7 @@ correct.
         try:
             with open(github_output_path, "a") as f:
                 f.write(f"category={category or 'UNKNOWN'}\n")
+                f.write(f"diagnosis-available={'true' if diagnosis_available else 'false'}\n")
                 f.write(f"cost-usd={cost_usd if cost_usd is not None else ''}\n")
                 f.write(f"input-tokens={input_tokens if input_tokens is not None else ''}\n")
                 f.write(f"output-tokens={output_tokens if output_tokens is not None else ''}\n")
