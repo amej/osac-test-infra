@@ -2,6 +2,19 @@
 # OSAC-3370: replay pull_request e2e runs after an unlock (label or CodeRabbit).
 # Called from .github/actions/e2e-start (and e2e-on-label.yml).
 #
+# Probe skip-vs-rerun before replaying full-install runs. A second unlock
+# (lgtm while CodeRabbit full-install is already running) must not POST
+# in_progress e2e-*-gate checks — those orphans block merge (osac#957) and
+# GitHub groups unbound posts under unrelated suites (auto-queue,
+# cancel-stale, ok-to-test).
+#
+# Cost-gate unlock labels are lgtm and e2e-ready only. ok-to-test is secrets
+# for fork PRs and must not start e2e or POST e2e-*-gate checks.
+# Never POST Checks API e2e-*-gate placeholders from this starter. GitHub
+# Checks have no pending status; posting in_progress makes them the required
+# check. Leave required gates unreported (pending) until native full-install
+# e2e-*-gate jobs report.
+#
 # Env:
 #   GH_TOKEN, REPO, PR_NUMBER
 #   EVENT_HEAD_SHA     optional; skip if PR head moved
@@ -14,6 +27,16 @@ set -euo pipefail
 TRIGGER_LABEL="${TRIGGER_LABEL:-e2e-ready}"
 SKIP_LABEL_CHECK="${SKIP_LABEL_CHECK:-false}"
 WORKFLOWS="${WORKFLOWS:-e2e-vmaas-full-install-caller.yml,e2e-bmaas-full-install-caller.yml,e2e-caas-full-install-caller.yml}"
+
+if [[ "${SKIP_LABEL_CHECK}" != "true" ]]; then
+  case "${TRIGGER_LABEL}" in
+    lgtm|e2e-ready) ;;
+    *)
+      echo "${TRIGGER_LABEL} is not a cost-gate unlock label; skipping start and not posting e2e-*-gate checks."
+      exit 0
+      ;;
+  esac
+fi
 
 # Returns 0 if the fetched PR JSON is still open.
 pr_is_open() {
@@ -163,8 +186,6 @@ if [[ "${SKIP_LABEL_CHECK}" == "true" ]]; then
 else
   export REASON="${TRIGGER_LABEL} unlock - waiting for fresh full-install run"
 fi
-dismiss_unlock_orphan_gate_checks || true
-bash "${lib_dir}/invalidate-e2e-gates.sh"
 
 E2E_WORKFLOWS=()
 IFS=',' read -ra _wfs <<< "${WORKFLOWS}"
@@ -186,6 +207,8 @@ SKIPPED=0
 PENDING=0
 STALE=0
 TIMEOUTS=0
+RERUN_WF=()
+RERUN_ID=()
 
 # Print the matching pull_request run JSON for workflow $1 at HEAD_SHA, or empty.
 find_pr_run() {
@@ -411,7 +434,16 @@ start_via_pr_run() {
     return
   fi
 
-  # Re-check head + label (and e2e-ready actor) immediately before rerun.
+  RERUN_WF+=("${wf}")
+  RERUN_ID+=("${run_id}")
+}
+
+# Re-check head/label immediately before rerun, then replay run $2 of workflow $1.
+rerun_queued_pr_run() {
+  local wf="$1"
+  local run_id="$2"
+  local cur_sha lbl_rc e2e_rc av_rc
+
   if ! pr_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}"); then
     echo "Failed to fetch PR #${PR_NUMBER} before rerun of ${wf}."
     ERRORS=$((ERRORS + 1))
@@ -494,17 +526,42 @@ for wf in "${E2E_WORKFLOWS[@]}"; do
   fi
 done
 
+if [[ ${#RERUN_WF[@]} -eq 0 ]]; then
+  echo "No full-install replay needed; skipping e2e-*-gate invalidation."
+else
+  dismiss_unlock_orphan_gate_checks || true
+  echo "Skipping e2e-*-gate Checks API posts; native full-install jobs report required gates (pending until they start)."
+  for i in "${!RERUN_WF[@]}"; do
+    set +e
+    rerun_queued_pr_run "${RERUN_WF[$i]}" "${RERUN_ID[$i]}"
+    wf_rc=$?
+    set -e
+    if [[ ${wf_rc} -ne 0 ]]; then
+      echo "Unexpected failure while rerunning ${RERUN_WF[$i]} (rc=${wf_rc})."
+      ERRORS=$((ERRORS + 1))
+    fi
+  done
+fi
+
 if [[ "${SKIP_LABEL_CHECK}" == "true" ]]; then
   {
     echo "### E2E on CodeRabbit approval"
     echo ""
-    echo "CodeRabbit APPROVED — starting expensive e2e (PR run replay)."
+    if [[ ${STARTED} -gt 0 ]]; then
+      echo "CodeRabbit APPROVED — starting expensive e2e (PR run replay)."
+    else
+      echo "CodeRabbit APPROVED — not starting a new full-install run."
+    fi
   } > /tmp/e2e-on-label.md
 else
   {
     echo "### E2E on \`${TRIGGER_LABEL}\`"
     echo ""
-    echo "Label \`${TRIGGER_LABEL}\` applied — starting expensive e2e (PR run replay)."
+    if [[ ${STARTED} -gt 0 ]]; then
+      echo "Label \`${TRIGGER_LABEL}\` applied — starting expensive e2e (PR run replay)."
+    else
+      echo "Label \`${TRIGGER_LABEL}\` applied — not starting a new full-install run."
+    fi
   } > /tmp/e2e-on-label.md
 fi
 {
@@ -514,6 +571,11 @@ fi
   fi
   if [[ ${PENDING} -gt 0 ]]; then
     echo "- Readiness not started (in-flight run will pick up unlock): ${PENDING}"
+  fi
+  if [[ ${#RERUN_WF[@]} -eq 0 && $((SKIPPED + PENDING)) -gt 0 ]]; then
+    echo "- Skipped gate invalidation (full-install already active or in-flight)."
+  elif [[ ${#RERUN_WF[@]} -gt 0 ]]; then
+    echo "- Did not POST e2e-*-gate Checks API checks (native jobs report; required gates stay pending until then)."
   fi
   if [[ ${STALE} -gt 0 ]]; then
     echo "- Head moved or label withdrawn (no rerun): ${STALE}"
